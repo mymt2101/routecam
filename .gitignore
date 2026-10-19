@@ -1,0 +1,25 @@
+# 動画データ（1ファイルで数GB、1日で数十GBになるため Git では管理しない）
+*.MP4
+*.mp4
+*.MOV
+*.mov
+*.insv
+*.lrv
+*.LRV
+*.thm
+*.THM
+
+# macOS
+.DS_Store
+
+# Node / Vite（今後の実装用）
+node_modules/
+dist/
+dist-ssr/
+*.local
+.vite/
+
+# Tauri / Electron（今後の実装用）
+src-tauri/target/
+out/
+release/
