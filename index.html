@@ -1,0 +1,293 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>routecam — 軌跡プレビュー</title>
+<link href="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.css" rel="stylesheet">
+<style>
+  :root { --bg:#1b1d21; --panel:#26292e; --fg:#e8eaed; --sub:#9aa0a6; --accent:#4c9aff; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; font:14px/1.5 -apple-system,BlinkMacSystemFont,"Hiragino Sans","Noto Sans JP",sans-serif; }
+  #map { position:absolute; inset:0; }
+  #panel {
+    position:absolute; left:12px; top:12px; z-index:10; width:300px; max-width:calc(100vw - 24px);
+    background:var(--panel); color:var(--fg); border-radius:10px; padding:14px;
+    box-shadow:0 4px 20px rgba(0,0,0,.35);
+  }
+  h1 { font-size:13px; margin:0 0 10px; letter-spacing:.04em; color:var(--sub); font-weight:600; }
+  #stats { margin-top:10px; font-size:12px; color:var(--sub); line-height:1.7; }
+  #stats b { color:var(--fg); font-weight:600; }
+  .row { display:flex; gap:6px; margin-top:10px; align-items:center; }
+  button { background:#363a41; color:var(--fg); border:0; border-radius:6px; padding:7px 12px; cursor:pointer; font-size:13px; }
+  button:hover { background:#434852; }
+  button.primary { background:var(--accent); color:#fff; min-width:72px; }
+  select { background:#363a41; color:var(--fg); border:0; border-radius:6px; padding:7px; font-size:13px; }
+  input[type=range] { width:100%; accent-color:var(--accent); }
+  #clock { font-variant-numeric:tabular-nums; font-size:12px; color:var(--fg); margin-top:8px; }
+  .hide { display:none; }
+  .maplibregl-ctrl-attrib { font-size:10px; }
+</style>
+</head>
+<body>
+<div id="map"></div>
+<div id="panel">
+  <h1>routecam — 軌跡プレビュー</h1>
+  <div id="stats">読み込み中…</div>
+  <div id="ui" class="hide">
+    <input type="range" id="seek" min="0" max="1000" value="0" step="1">
+    <div id="clock"></div>
+    <div class="row">
+      <button class="primary" id="play">再生</button>
+      <select id="speed">
+        <option value="1">1x</option>
+        <option value="10">10x</option>
+        <option value="60" selected>60x</option>
+        <option value="300">300x</option>
+        <option value="1000">1000x</option>
+      </select>
+      <button id="fit">全体</button>
+    </div>
+  </div>
+</div>
+
+<script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
+<script>
+const GAP_SEC = 60; // これ以上あいたら線を分ける（実データで60秒超の欠損が58箇所）
+
+const map = new maplibregl.Map({
+  container: 'map',
+  style: {
+    version: 8,
+    sources: {
+      gsi: {
+        type: 'raster', tiles: ['https://cyberjapandata.gsi.go.jp/xyz/pale/{z}/{x}/{y}.png'],
+        tileSize: 256, maxzoom: 18,
+        attribution: '<a href="https://maps.gsi.go.jp/development/ichiran.html">国土地理院</a>'
+      }
+    },
+    layers: [{ id: 'gsi', type: 'raster', source: 'gsi' }]
+  },
+  center: [142.02, 44.91], zoom: 9
+});
+map.addControl(new maplibregl.NavigationControl(), 'top-right');
+map.addControl(new maplibregl.ScaleControl(), 'bottom-right');
+
+let track = null;   // { pts:[{lon,lat,t}], segments:[[idx..]], t0, t1 }
+let cursor = 0;     // 経過秒（t0 からの相対）
+let playing = false;
+let lastFrame = 0;
+let travelIdx = 0;
+let travelCoords = [];
+
+const $ = id => document.getElementById(id);
+
+// ---- GPX 読み込み ---------------------------------------------------------
+function parseGPX(text) {
+  const doc = new DOMParser().parseFromString(text, 'application/xml');
+  if (doc.querySelector('parsererror')) throw new Error('XMLとして読めませんでした');
+  const nodes = doc.getElementsByTagName('trkpt');
+  if (!nodes.length) throw new Error('trkpt が見つかりません');
+
+  const pts = [];
+  for (const n of nodes) {
+    const lat = parseFloat(n.getAttribute('lat'));
+    const lon = parseFloat(n.getAttribute('lon'));
+    const tEl = n.getElementsByTagName('time')[0];
+    if (!isFinite(lat) || !isFinite(lon) || !tEl) continue;
+    const t = Date.parse(tEl.textContent); // GPXのtimeはUTC
+    if (!isFinite(t)) continue;
+    pts.push({ lon, lat, t: t / 1000 });
+  }
+  if (pts.length < 2) throw new Error('有効な点が足りません');
+  pts.sort((a, b) => a.t - b.t);
+
+  // GPSが途切れた区間で線を分ける
+  const segments = [];
+  let cur = [0];
+  for (let i = 1; i < pts.length; i++) {
+    if (pts[i].t - pts[i - 1].t > GAP_SEC) { segments.push(cur); cur = []; }
+    cur.push(i);
+  }
+  segments.push(cur);
+
+  return { pts, segments, t0: pts[0].t, t1: pts[pts.length - 1].t };
+}
+
+// ---- 描画 -----------------------------------------------------------------
+function setSource(id, data) {
+  const src = map.getSource(id);
+  if (src) src.setData(data);
+}
+
+function render(t) {
+  // 全ルート（欠損で分割したMultiLineString）
+  const full = {
+    type: 'Feature', geometry: {
+      type: 'MultiLineString',
+      coordinates: t.segments.filter(s => s.length > 1).map(s => s.map(i => [t.pts[i].lon, t.pts[i].lat]))
+    }
+  };
+  const empty = { type: 'FeatureCollection', features: [] };
+
+  if (!map.getSource('route')) {
+    map.addSource('route', { type: 'geojson', data: full });
+    map.addSource('travelled', { type: 'geojson', data: empty });
+    map.addSource('dot', { type: 'geojson', data: empty });
+    map.addLayer({ id: 'route', type: 'line', source: 'route',
+      paint: { 'line-color': '#4c9aff', 'line-width': 2.5, 'line-opacity': 0.28 },
+      layout: { 'line-join': 'round', 'line-cap': 'round' } });
+    map.addLayer({ id: 'travelled', type: 'line', source: 'travelled',
+      paint: { 'line-color': '#4c9aff', 'line-width': 4 },
+      layout: { 'line-join': 'round', 'line-cap': 'round' } });
+    map.addLayer({ id: 'dot-halo', type: 'circle', source: 'dot',
+      paint: { 'circle-radius': 11, 'circle-color': '#4c9aff', 'circle-opacity': 0.25 } });
+    map.addLayer({ id: 'dot', type: 'circle', source: 'dot',
+      paint: { 'circle-radius': 6, 'circle-color': '#fff', 'circle-stroke-color': '#2b6fd6', 'circle-stroke-width': 3 } });
+  } else {
+    setSource('route', full);
+    setSource('travelled', empty);
+    setSource('dot', empty);
+  }
+  fitBounds();
+}
+
+function fitBounds() {
+  if (!track) return;
+  const b = new maplibregl.LngLatBounds();
+  for (const p of track.pts) b.extend([p.lon, p.lat]);
+  map.fitBounds(b, { padding: { top: 40, bottom: 40, left: 330, right: 40 }, duration: 600 });
+}
+
+// 2点間の距離（m）
+function distance(a, b) {
+  const R = 6371008.8, rad = Math.PI / 180;
+  const dLat = (b.lat - a.lat) * rad;
+  const dLon = (b.lon - a.lon) * rad;
+  const la = a.lat * rad, lb = b.lat * rad;
+  const h = Math.sin(dLat / 2) ** 2 + Math.cos(la) * Math.cos(lb) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(h));
+}
+
+// 走行距離（m）。GPSが途切れた区間は経路が分からないため加算しない
+function totalDistance(t) {
+  let m = 0;
+  for (const seg of t.segments)
+    for (let k = 1; k < seg.length; k++)
+      m += distance(t.pts[seg[k - 1]], t.pts[seg[k]]);
+  return m;
+}
+
+// 時刻 → 位置（点と点のあいだは線形補間）
+function positionAt(sec) {
+  const pts = track.pts, abs = track.t0 + sec;
+  let lo = 0, hi = pts.length - 1;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (pts[m].t < abs) lo = m + 1; else hi = m; }
+  const i = Math.max(1, lo);
+  const a = pts[i - 1], b = pts[i];
+  const span = b.t - a.t;
+  // 欠損区間ではワープさせず、手前の点に留める
+  if (span > GAP_SEC) return { lon: a.lon, lat: a.lat, idx: i - 1 };
+  const r = span > 0 ? (abs - a.t) / span : 0;
+  return { lon: a.lon + (b.lon - a.lon) * r, lat: a.lat + (b.lat - a.lat) * r, idx: i - 1 };
+}
+
+function update(sec) {
+  cursor = Math.max(0, Math.min(sec, track.t1 - track.t0));
+  const pos = positionAt(cursor);
+
+  // 走行済みの線は、進んだぶんだけ継ぎ足す（巻き戻しのときだけ作り直す）
+  if (pos.idx < travelIdx) { travelIdx = 0; travelCoords = []; }
+  while (travelIdx <= pos.idx) {
+    const p = track.pts[travelIdx];
+    const prev = track.pts[travelIdx - 1];
+    // 欠損をまたぐ所は線をつなげない（null で切る）
+    if (prev && p.t - prev.t > GAP_SEC) travelCoords.push(null);
+    travelCoords.push([p.lon, p.lat]);
+    travelIdx++;
+  }
+  const lines = [];
+  let run = [];
+  for (const c of travelCoords.concat([null])) {
+    if (c === null) { if (run.length > 1) lines.push(run); run = []; }
+    else run.push(c);
+  }
+  const tail = lines.length ? lines[lines.length - 1] : null;
+  if (tail) tail.push([pos.lon, pos.lat]);
+
+  setSource('travelled', { type: 'Feature', geometry: { type: 'MultiLineString', coordinates: lines } });
+  setSource('dot', { type: 'Feature', geometry: { type: 'Point', coordinates: [pos.lon, pos.lat] } });
+
+  const total = track.t1 - track.t0;
+  $('seek').value = Math.round(cursor / total * 1000);
+  const d = new Date((track.t0 + cursor) * 1000);
+  $('clock').textContent =
+    d.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false }) + ' JST';
+}
+
+const fmt = s => {
+  s = Math.round(s);
+  return `${String(Math.floor(s/3600)).padStart(2,'0')}:${String(Math.floor(s/60)%60).padStart(2,'0')}:${String(s%60).padStart(2,'0')}`;
+};
+
+// ---- 再生ループ -----------------------------------------------------------
+function tick(now) {
+  if (playing && track) {
+    const dt = (now - lastFrame) / 1000;
+    const next = cursor + dt * Number($('speed').value);
+    if (next >= track.t1 - track.t0) { update(track.t1 - track.t0); setPlaying(false); }
+    else update(next);
+  }
+  lastFrame = now;
+  requestAnimationFrame(tick);
+}
+requestAnimationFrame(tick);
+
+function setPlaying(v) {
+  playing = v;
+  $('play').textContent = v ? '一時停止' : '再生';
+}
+
+// ---- 入力 -----------------------------------------------------------------
+function load(text, label) {
+  try {
+    track = parseGPX(text);
+    travelIdx = 0; travelCoords = [];
+    const total = track.t1 - track.t0;
+    const km = totalDistance(track) / 1000;
+    $('stats').innerHTML =
+      `<b>${label}</b><br>` +
+      `走行距離 <b>${km.toFixed(1)} km</b>　記録時間 <b>${fmt(total)}</b><br>` +
+      `点の数 <b>${track.pts.length.toLocaleString()}</b>`;
+    $('ui').classList.remove('hide');
+    render(track);
+    setPlaying(false);
+    update(0);
+  } catch (e) {
+    $('stats').innerHTML = `<b style="color:#ff8080">読み込めませんでした</b><br>${e.message}`;
+  }
+}
+
+$('play').onclick = () => { if (track) setPlaying(!playing); };
+$('fit').onclick = fitBounds;
+$('seek').oninput = e => { if (track) update(Number(e.target.value) / 1000 * (track.t1 - track.t0)); };
+document.addEventListener('keydown', e => {
+  if (e.code === 'Space' && track) { e.preventDefault(); setPlaying(!playing); }
+});
+
+// 読み込むGPX（original/ に置いたデータを直接読む）
+const GPX_PATH = 'original/Log20260925-082845.gpx';
+
+map.on('load', () => {
+  fetch(GPX_PATH)
+    .then(r => r.ok ? r.text() : Promise.reject(new Error(`${r.status} ${r.statusText}`)))
+    .then(t => load(t, GPX_PATH.split('/').pop()))
+    .catch(e => {
+      $('stats').innerHTML =
+        `<b style="color:#ff8080">GPXを読み込めませんでした</b><br>` +
+        `${GPX_PATH}<br>${e.message}`;
+    });
+});
+</script>
+</body>
+</html>
