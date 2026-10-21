@@ -53,7 +53,36 @@
 
 <script src="https://unpkg.com/maplibre-gl@4.7.1/dist/maplibre-gl.js"></script>
 <script>
-const GAP_SEC = 60; // これ以上あいたら線を分ける（実データで60秒超の欠損が58箇所）
+/* ============================================================================
+   処理の全体像
+
+   【起動時】1回だけ走る
+     map.on('load')  地図の準備ができたら
+       → fetch()       original/ のGPXファイルを読む
+       → load()        読み込み全体の司令塔
+           → parseGPX()  XMLの文字列 → 扱いやすいデータ構造に変換
+           → render()    地図に「全ルートの線」「走行済みの線」「点」の
+                         3つの入れ物（レイヤー）を作る ※中身はまだ空
+           → update(0)   開始時刻の状態を描く
+
+   【再生中】1秒に約60回くりかえす
+     tick()          時刻を進める（どこまで進んだかを決めるだけ）
+       → update()      その時刻の状態を描く
+           → positionAt()  時刻 → 座標 を計算する
+           → setSource()   座標を地図に渡す → MapLibreが描画
+
+   ポイントは tick() と update() の役割分担。
+   「時刻を決める人」と「その時刻を描く人」を分けてある。
+   そのため時刻の決まり方が増えても update() から先は変更不要で、
+     ・再生中        → tick() が自動で進める
+     ・シークバー操作 → oninput が直接 update() を呼ぶ
+     ・（フェーズ2）  → 動画の再生位置から時刻を出して update() を呼ぶ
+   のどれでも、同じ update() を使い回せる。
+   ============================================================================ */
+
+// GPSが途切れたと判断する間隔（秒）。実データでは60秒超の欠損が58箇所あった。
+// この値は「線を分ける」「点をワープさせない」「距離に加算しない」の3箇所で使う。
+const GAP_SEC = 60;
 
 const map = new maplibregl.Map({
   container: 'map',
@@ -73,12 +102,25 @@ const map = new maplibregl.Map({
 map.addControl(new maplibregl.NavigationControl(), 'top-right');
 map.addControl(new maplibregl.ScaleControl(), 'bottom-right');
 
-let track = null;   // { pts:[{lon,lat,t}], segments:[[idx..]], t0, t1 }
-let cursor = 0;     // 経過秒（t0 からの相対）
-let playing = false;
-let lastFrame = 0;
-let travelIdx = 0;
-let travelCoords = [];
+// ---- アプリが覚えておく状態 ------------------------------------------------
+
+// 読み込んだGPXのデータ。parseGPX() が作る
+//   pts      … 全ての点 [{ lon, lat, t }]。t はUNIX時間（秒）
+//   segments … 欠損で区切った点番号のまとまり [[0,1,2...], [58,59...]]
+//   t0 / t1  … 記録の開始時刻と終了時刻（UNIX時間・秒）
+let track = null;
+
+// いま再生中の位置。「GPXの開始時刻(t0)から何秒進んだか」を表す。
+// 時計から取るのではなく、このアプリが自分で進めていく数字。
+let cursor = 0;
+
+let playing = false;   // 再生中かどうか
+let lastFrame = 0;     // 前フレームの時刻。経過時間を測るために使う
+
+// 走行済みの線を描くための作業用。
+// 毎フレーム全点を作り直すと重いので、進んだぶんだけ継ぎ足していく。
+let travelIdx = 0;       // どの点番号まで線に追加したか
+let travelCoords = [];   // 追加済みの座標。欠損の区切りには null を入れる
 
 const $ = id => document.getElementById(id);
 
@@ -179,48 +221,100 @@ function totalDistance(t) {
 }
 
 // 時刻 → 位置（点と点のあいだは線形補間）
+// この関数が同期処理の心臓部。
+// 「開始から sec 秒後」に車がいた座標を返す。
+// GPXの点は1秒おきにしか無いので、点と点のあいだは直線で補って滑らかに見せる。
+// 戻り値 { lon, lat, idx }。idx は「通過済みの最後の点番号」
 function positionAt(sec) {
-  const pts = track.pts, abs = track.t0 + sec;
+  const pts = track.pts;
+  const abs = track.t0 + sec;   // 相対秒 → 実際のUNIX時間に直す
+
+  // 【1】該当する点を二分探索で探す
+  //   16,303点を先頭から順に見ると遅いので、範囲を半分ずつ絞り込む。
+  //   16,303点でも14回ほどの比較で見つかる。
+  //   終了時 lo は「時刻 abs 以降で最初の点」の番号になる。
   let lo = 0, hi = pts.length - 1;
-  while (lo < hi) { const m = (lo + hi) >> 1; if (pts[m].t < abs) lo = m + 1; else hi = m; }
-  const i = Math.max(1, lo);
-  const a = pts[i - 1], b = pts[i];
-  const span = b.t - a.t;
-  // 欠損区間ではワープさせず、手前の点に留める
+  while (lo < hi) {
+    const m = (lo + hi) >> 1;        // >>1 は「2で割って切り捨て」の速い書き方
+    if (pts[m].t < abs) lo = m + 1;  // まだ手前 → 後ろ半分を探す
+    else hi = m;                     // 行き過ぎ → 前半分を探す（m自身は残す）
+  }
+
+  // 【2】求めた点と、その1つ手前の点を取り出す。
+  //   車はこの2点のあいだのどこかにいる。
+  const i = Math.max(1, lo);   // lo が 0 だと a が作れないので最低1にする
+  const a = pts[i - 1];        // 手前の点
+  const b = pts[i];            // 次の点
+  const span = b.t - a.t;      // 2点の時間差（秒）
+
+  // 【3】欠損区間（2点が離れすぎ）なら、補間せず手前の点に留める。
+  //   ここで補間すると、23分の空白を直線で突っ切る「ワープ」になってしまう。
   if (span > GAP_SEC) return { lon: a.lon, lat: a.lat, idx: i - 1 };
+
+  // 【4】線形補間：a と b のあいだのどこにいるかを 0〜1 の比率で求め、
+  //   その比率ぶんだけ a から b へ寄せた座標を返す。
+  //   例）a が 10秒、b が 12秒、いま 11秒 → r = 0.5 → ちょうど中間地点
   const r = span > 0 ? (abs - a.t) / span : 0;
-  return { lon: a.lon + (b.lon - a.lon) * r, lat: a.lat + (b.lat - a.lat) * r, idx: i - 1 };
+  return {
+    lon: a.lon + (b.lon - a.lon) * r,
+    lat: a.lat + (b.lat - a.lat) * r,
+    idx: i - 1
+  };
 }
 
+// 「指定された時刻の状態」を画面に描く。
+// 再生中・シークバー操作・読み込み直後、どこから呼ばれても同じ処理をする。
+// 時刻をどう決めるかはこの関数の外側（tick / oninput）の仕事。
 function update(sec) {
+
+  // 【1】時刻を確定する。0 未満や記録の終端を超えないように丸める
   cursor = Math.max(0, Math.min(sec, track.t1 - track.t0));
+
+  // 【2】その時刻の座標を求める
   const pos = positionAt(cursor);
 
-  // 走行済みの線は、進んだぶんだけ継ぎ足す（巻き戻しのときだけ作り直す）
+  // 【3】走行済みの線を伸ばす
+  //   毎フレーム16,303点を作り直すと重いので、前回から進んだぶんだけ追加する。
+  //   シークバーで巻き戻された時（進んだ先より手前に戻った時）だけ、
+  //   作り直しになるので空にしてやり直す。
   if (pos.idx < travelIdx) { travelIdx = 0; travelCoords = []; }
   while (travelIdx <= pos.idx) {
     const p = track.pts[travelIdx];
     const prev = track.pts[travelIdx - 1];
-    // 欠損をまたぐ所は線をつなげない（null で切る）
+    // 欠損をまたぐ所には目印として null を入れ、線が繋がらないようにする
     if (prev && p.t - prev.t > GAP_SEC) travelCoords.push(null);
     travelCoords.push([p.lon, p.lat]);
     travelIdx++;
   }
+
+  // 【4】null を区切りにして、座標の列を「線の集まり」に切り分ける。
+  //   [a, b, null, c, d] → [[a, b], [c, d]] という形にする。
+  //   末尾に null を足しているのは、最後の線も忘れず取り出すための目印。
   const lines = [];
-  let run = [];
+  let run = [];                                  // 組み立て中の1本の線
   for (const c of travelCoords.concat([null])) {
-    if (c === null) { if (run.length > 1) lines.push(run); run = []; }
-    else run.push(c);
+    if (c === null) {                            // 区切りに来た
+      if (run.length > 1) lines.push(run);       // 点1つだけの線は捨てる
+      run = [];
+    } else {
+      run.push(c);
+    }
   }
+
+  // 【5】最後の線の先端に、いまの座標（点と点のあいだの補間位置）を足す。
+  //   これが無いと、線が点より最大1秒ぶん遅れてカクカクして見える。
   const tail = lines.length ? lines[lines.length - 1] : null;
   if (tail) tail.push([pos.lon, pos.lat]);
 
+  // 【6】できた図形をMapLibreに渡す。あとはMapLibreが勝手に描いてくれる
   setSource('travelled', { type: 'Feature', geometry: { type: 'MultiLineString', coordinates: lines } });
-  setSource('dot', { type: 'Feature', geometry: { type: 'Point', coordinates: [pos.lon, pos.lat] } });
+  setSource('dot',       { type: 'Feature', geometry: { type: 'Point', coordinates: [pos.lon, pos.lat] } });
 
+  // 【7】シークバーの位置と時刻表示を合わせる。
+  //   シークバーは 0〜1000 の目盛りなので、全体に対する割合に直して入れる。
   const total = track.t1 - track.t0;
   $('seek').value = Math.round(cursor / total * 1000);
-  const d = new Date((track.t0 + cursor) * 1000);
+  const d = new Date((track.t0 + cursor) * 1000);   // UNIX秒 → Dateはミリ秒なので1000倍
   $('clock').textContent =
     d.toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo', hour12: false }) + ' JST';
 }
@@ -231,16 +325,34 @@ const fmt = s => {
 };
 
 // ---- 再生ループ -----------------------------------------------------------
+// requestAnimationFrame により、画面の更新に合わせて1秒に約60回呼ばれる。
+// この関数の仕事は「時刻をどこまで進めるか」を決めることだけ。
+// 実際に描くのは update() の役目。
+// 引数 now はブラウザが渡してくる「ページ表示開始からの経過ミリ秒」。
 function tick(now) {
   if (playing && track) {
+
+    // 前フレームからの実際の経過秒。
+    // フレーム数ではなく時間で計算するので、
+    // 処理が重くて frame が飛んでも再生速度が遅くならない。
     const dt = (now - lastFrame) / 1000;
+
+    // 実時間の経過 × 再生倍率 = ドライブ上で進む秒数。
+    // 60倍速なら、実時間1秒につきドライブの時刻が60秒進む。
     const next = cursor + dt * Number($('speed').value);
-    if (next >= track.t1 - track.t0) { update(track.t1 - track.t0); setPlaying(false); }
-    else update(next);
+
+    if (next >= track.t1 - track.t0) {
+      update(track.t1 - track.t0);   // 終端ぴったりで止める
+      setPlaying(false);
+    } else {
+      update(next);                  // その時刻の状態を描いてもらう
+    }
   }
   lastFrame = now;
-  requestAnimationFrame(tick);
+  requestAnimationFrame(tick);   // 次のフレームでも自分を呼んでもらう
 }
+
+// 最初の1回。あとは tick() の中から自動でくりかえされる
 requestAnimationFrame(tick);
 
 function setPlaying(v) {
